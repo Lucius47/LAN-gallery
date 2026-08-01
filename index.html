@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local Photo Gallery</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #090d16; }
+    ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #334155; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useCallback } = React;
+
+    function App() {
+      // Helper to compute reliable server base URL
+      const getDefaultServerUrl = () => {
+        const saved = localStorage.getItem('lpg_server_url');
+        if (saved && saved.trim() !== '') return saved.trim();
+        if (window.location.protocol === 'file:') return 'http://localhost:8080';
+        return (window.location.origin && window.location.origin !== 'null') 
+          ? window.location.origin 
+          : 'http://localhost:8080';
+      };
+
+      const [serverUrl, setServerUrl] = useState(getDefaultServerUrl);
+      const [photos, setPhotos] = useState([]);
+      const [tags, setTags] = useState([]);
+      const [status, setStatus] = useState(null);
+      const [activeTab, setActiveTab] = useState('gallery'); // 'gallery' | 'settings'
+      const [selectedTag, setSelectedTag] = useState('');
+      const [searchQuery, setSearchQuery] = useState('');
+      const [activePhotoIndex, setActivePhotoIndex] = useState(null);
+      const [notification, setNotification] = useState(null);
+
+      // Pagination & Loading state
+      const [page, setPage] = useState(1);
+      const [pageSize, setPageSize] = useState(120);
+      const [totalPhotosCount, setTotalPhotosCount] = useState(0);
+      const [isLoading, setIsLoading] = useState(false);
+      const [hasMore, setHasMore] = useState(true);
+
+      // Server directory management state
+      const [newDirectoryPath, setNewDirectoryPath] = useState('');
+      const [newTagName, setNewTagName] = useState('');
+      const [newTagCategory, setNewTagCategory] = useState('general');
+
+      const getAssetUrl = useCallback((path) => {
+        if (!path) return '';
+        if (path.startsWith('http://') || path.startsWith('https://')) return path;
+        
+        let base = (serverUrl && serverUrl.trim() !== '') ? serverUrl.trim() : 'http://localhost:8080';
+        base = base.replace(/\/+$/, '');
+        const cleanPath = path.startsWith('/') ? path : '/' + path;
+        return `${base}${cleanPath}`;
+      }, [serverUrl]);
+
+      const notify = (message, type = 'info') => {
+        setNotification({ message, type });
+        setTimeout(() => setNotification(null), 4000);
+      };
+
+      const fetchPhotos = async (pageNum = 1, append = false, currentLimit = pageSize) => {
+        setIsLoading(true);
+        try {
+          const queryParams = new URLSearchParams({
+            page: pageNum.toString(),
+            limit: currentLimit.toString()
+          });
+          if (selectedTag) queryParams.append('tags', selectedTag);
+
+          const endpoint = getAssetUrl(`/api/v1/photos?${queryParams.toString()}`);
+          const res = await fetch(endpoint);
+          if (!res.ok) throw new Error('Failed to fetch photos');
+          
+          const data = await res.json();
+          const loadedPhotos = data.data || [];
+          const total = data.total || 0;
+
+          setTotalPhotosCount(total);
+          
+          if (append) {
+            setPhotos(prev => [...prev, ...loadedPhotos]);
+          } else {
+            setPhotos(loadedPhotos);
+          }
+
+          const currentCount = append ? photos.length + loadedPhotos.length : loadedPhotos.length;
+          setHasMore(currentCount < total && loadedPhotos.length > 0);
+          setPage(pageNum);
+        } catch (err) {
+          notify(`Cannot connect to backend server at ${serverUrl}. Ensure main.go is running!`, 'error');
+        } finally {
+          setIsLoading(false);
+        }
+      };
+
+      const handleLoadMore = () => {
+        if (!isLoading && hasMore) {
+          fetchPhotos(page + 1, true, pageSize);
+        }
+      };
+
+      const fetchTags = async () => {
+        try {
+          const res = await fetch(getAssetUrl('/api/v1/tags'));
+          if (res.ok) {
+            const data = await res.json();
+            setTags(data || []);
+          }
+        } catch (err) {
+          console.error('Tags fetch error:', err);
+        }
+      };
+
+      const fetchStatus = async () => {
+        try {
+          const res = await fetch(getAssetUrl('/api/v1/system/status'));
+          if (res.ok) {
+            const data = await res.json();
+            setStatus(data);
+          }
+        } catch (err) {
+          console.error('Status fetch error:', err);
+        }
+      };
+
+      useEffect(() => {
+        fetchPhotos(1, false, pageSize);
+        fetchTags();
+        fetchStatus();
+      }, [serverUrl, selectedTag, pageSize]);
+
+      useEffect(() => {
+        localStorage.setItem('lpg_server_url', serverUrl);
+      }, [serverUrl]);
+
+      const handleAddDirectory = async (e) => {
+        e.preventDefault();
+        if (!newDirectoryPath.trim()) return;
+
+        try {
+          const res = await fetch(getAssetUrl('/api/v1/system/directories'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ directory: newDirectoryPath.trim(), action: 'add' })
+          });
+          if (res.ok) {
+            notify('Directory added and scan initiated!', 'success');
+            setNewDirectoryPath('');
+            fetchStatus();
+            fetchPhotos(1, false, pageSize);
+          } else {
+            notify('Failed to add directory.', 'error');
+          }
+        } catch (err) {
+          notify('Server communication error.', 'error');
+        }
+      };
+
+      const handleRemoveDirectory = async (dirPath) => {
+        try {
+          const res = await fetch(getAssetUrl('/api/v1/system/directories'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ directory: dirPath, action: 'remove' })
+          });
+          if (res.ok) {
+            notify('Directory removed from scan list.', 'info');
+            fetchStatus();
+          }
+        } catch (err) {
+          notify('Server communication error.', 'error');
+        }
+      };
+
+      const handleTriggerScan = async () => {
+        try {
+          const res = await fetch(getAssetUrl('/api/v1/system/scan'), { method: 'POST' });
+          if (res.ok) {
+            notify('Background directory scan started...', 'info');
+            fetchStatus();
+            setTimeout(() => fetchPhotos(1, false, pageSize), 2000);
+          }
+        } catch (err) {
+          notify('Failed to trigger scan.', 'error');
+        }
+      };
+
+      const handlePurgeCache = async () => {
+        try {
+          const res = await fetch(getAssetUrl('/api/v1/system/purge-cache'), { method: 'POST' });
+          if (res.ok) {
+            notify('Thumbnail cache purged successfully!', 'success');
+            fetchStatus();
+          }
+        } catch (err) {
+          notify('Failed to purge cache.', 'error');
+        }
+      };
+
+      const handleCreateTag = async (e) => {
+        e.preventDefault();
+        if (!newTagName.trim()) return;
+
+        try {
+          const res = await fetch(getAssetUrl('/api/v1/tags'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: newTagName.trim(), category: newTagCategory })
+          });
+          if (res.ok) {
+            notify(`Tag "${newTagName.trim()}" created!`, 'success');
+            setNewTagName('');
+            fetchTags();
+          }
+        } catch (err) {
+          notify('Failed to create tag.', 'error');
+        }
+      };
+
+      const handleAttachTagToPhoto = async (photoId, tagId) => {
+        try {
+          const res = await fetch(getAssetUrl(`/api/v1/photos/${photoId}/tags`), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tag_id: tagId })
+          });
+          if (res.ok) {
+            notify('Tag attached to photo', 'success');
+            fetchPhotos(page, false, pageSize);
+          }
+        } catch (err) {
+          notify('Failed to attach tag', 'error');
+        }
+      };
+
+      const handleDetachTagFromPhoto = async (photoId, tagId) => {
+        try {
+          const res = await fetch(getAssetUrl(`/api/v1/photos/${photoId}/tags/${tagId}`), {
+            method: 'DELETE'
+          });
+          if (res.ok) {
+            notify('Tag detached from photo', 'info');
+            fetchPhotos(page, false, pageSize);
+          }
+        } catch (err) {
+          notify('Failed to detach tag', 'error');
+        }
+      };
+
+      const filteredPhotos = useMemo(() => {
+        return photos.filter(photo => {
+          if (!searchQuery.trim()) return true;
+          const query = searchQuery.toLowerCase();
+          const matchesName = photo.file_name?.toLowerCase().includes(query);
+          const matchesCamera = photo.camera_make?.toLowerCase().includes(query) || photo.camera_model?.toLowerCase().includes(query);
+          const matchesTags = photo.tags?.some(t => t.name.toLowerCase().includes(query));
+          return matchesName || matchesCamera || matchesTags;
+        });
+      }, [photos, searchQuery]);
+
+      return (
+        <div className="flex flex-col h-screen overflow-hidden bg-slate-950 text-slate-100">
+          
+          {/* Notification Banner */}
+          {notification && (
+            <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-xl border text-sm flex items-center gap-3 transition-all ${
+              notification.type === 'error' ? 'bg-rose-950 border-rose-800 text-rose-200' :
+              notification.type === 'success' ? 'bg-emerald-950 border-emerald-800 text-emerald-200' :
+              'bg-slate-900 border-slate-700 text-slate-200'
+            }`}>
+              <i className={`fas ${
+                notification.type === 'error' ? 'fa-exclamation-circle' :
+                notification.type === 'success' ? 'fa-check-circle' : 'fa-info-circle'
+              }`}></i>
+              <span>{notification.message}</span>
+            </div>
+          )}
+
+          {}
+          <header className="h-16 border-b border-slate-800 bg-slate-900/80 backdrop-blur px-6 flex items-center justify-between flex-shrink-0 z-10">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-lg bg-indigo-600 flex items-center justify-center text-white shadow-lg shadow-indigo-600/30">
+                <i className="fas fa-camera-retro text-lg"></i>
+              </div>
+              <div>
+                <h1 className="font-bold text-lg leading-none tracking-tight">Local Photo Gallery</h1>
+                <p className="text-xs text-slate-400 mt-1">Offline-first local image browser</p>
+              </div>
+            </div>
+
+            {/* Global Search Bar */}
+            {activeTab === 'gallery' && (
+              <div className="flex-1 max-w-md mx-6">
+                <div className="relative">
+                  <i className="fas fa-search absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
+                  <input
+                    type="text"
+                    placeholder="Search photos by filename, tag, or camera..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-10 pr-4 py-2 text-sm focus:outline-none focus:border-indigo-500 text-slate-200 placeholder-slate-500"
+                  />
+                  {searchQuery && (
+                    <button onClick={() => setSearchQuery('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300">
+                      <i className="fas fa-times text-xs"></i>
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Navigation Tabs & Controls */}
+            <div className="flex items-center gap-3">
+              {activeTab === 'gallery' && (
+                <div className="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-slate-400">
+                  <span>Batch size:</span>
+                  <select
+                    value={pageSize}
+                    onChange={(e) => setPageSize(Number(e.target.value))}
+                    className="bg-transparent text-indigo-400 font-medium focus:outline-none cursor-pointer"
+                  >
+                    <option value={60} className="bg-slate-900">60</option>
+                    <option value={120} className="bg-slate-900">120</option>
+                    <option value={250} className="bg-slate-900">250</option>
+                    <option value={500} className="bg-slate-900">500</option>
+                  </select>
+                </div>
+              )}
+
+              <button
+                onClick={() => setActiveTab('gallery')}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 ${
+                  activeTab === 'gallery' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                }`}
+              >
+                <i className="fas fa-images"></i>
+                <span>Gallery</span>
+              </button>
+              <button
+                onClick={() => setActiveTab('settings')}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 ${
+                  activeTab === 'settings' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                }`}
+              >
+                <i className="fas fa-sliders-h"></i>
+                <span>Server & Settings</span>
+              </button>
+            </div>
+          </header>
+
+          {/* Main Body */}
+          <div className="flex-1 flex overflow-hidden">
+            
+            {/* GALLERY TAB */}
+            {activeTab === 'gallery' && (
+              <div className="flex-1 flex overflow-hidden">
+                
+                {}
+                <aside className="w-64 border-r border-slate-800 bg-slate-900/40 p-4 flex flex-col gap-4 overflow-y-auto flex-shrink-0">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Tags Filter</h2>
+                    {selectedTag && (
+                      <button onClick={() => setSelectedTag('')} className="text-xs text-indigo-400 hover:underline">
+                        Clear filter
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="space-y-1">
+                    <button
+                      onClick={() => setSelectedTag('')}
+                      className={`w-full text-left px-3 py-2 rounded-lg text-sm flex items-center justify-between transition-colors ${
+                        selectedTag === '' ? 'bg-slate-800 text-indigo-400 font-medium' : 'text-slate-300 hover:bg-slate-800/60'
+                      }`}
+                    >
+                      <span>All Photos</span>
+                      <span className="text-xs text-slate-500">{totalPhotosCount}</span>
+                    </button>
+
+                    {tags.map(tag => (
+                      <button
+                        key={tag.id}
+                        onClick={() => setSelectedTag(tag.name)}
+                        className={`w-full text-left px-3 py-2 rounded-lg text-sm flex items-center justify-between transition-colors ${
+                          selectedTag === tag.name ? 'bg-slate-800 text-indigo-400 font-medium' : 'text-slate-300 hover:bg-slate-800/60'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 truncate">
+                          <i className="fas fa-tag text-xs text-slate-500"></i>
+                          <span className="truncate">{tag.name}</span>
+                        </div>
+                        <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+                          {tag.category}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Create New Tag */}
+                  <form onSubmit={handleCreateTag} className="mt-auto pt-4 border-t border-slate-800 space-y-2">
+                    <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">New Tag</h3>
+                    <input
+                      type="text"
+                      placeholder="Tag name..."
+                      value={newTagName}
+                      onChange={(e) => setNewTagName(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                    />
+                    <select
+                      value={newTagCategory}
+                      onChange={(e) => setNewTagCategory(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="general">General</option>
+                      <option value="person">Person</option>
+                      <option value="location">Location</option>
+                      <option value="event">Event</option>
+                    </select>
+                    <button
+                      type="submit"
+                      className="w-full py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-xs font-medium transition-colors"
+                    >
+                      Add Tag
+                    </button>
+                  </form>
+                </aside>
+
+                {}
+                <main className="flex-1 p-6 overflow-y-auto flex flex-col justify-between">
+                  {filteredPhotos.length === 0 && !isLoading ? (
+                    <div className="h-full flex flex-col items-center justify-center text-center p-8 text-slate-500">
+                      <i className="fas fa-folder-open text-5xl mb-4 text-slate-700"></i>
+                      <h3 className="text-lg font-medium text-slate-400">No photos found</h3>
+                      <p className="text-sm mt-1 max-w-sm">
+                        {totalPhotosCount === 0 
+                          ? 'Go to "Server & Settings" to add your local Windows photo directories.' 
+                          : 'Try clearing your search query or tag filter.'}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-6">
+                      
+                      {/* Photo Grid */}
+                      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+                        {filteredPhotos.map((photo, index) => (
+                          <div
+                            key={photo.id}
+                            onClick={() => setActivePhotoIndex(index)}
+                            className="group relative aspect-square bg-slate-900 rounded-lg overflow-hidden border border-slate-800 hover:border-indigo-500 cursor-pointer transition-all hover:scale-[1.02] shadow-md"
+                          >
+                            <img
+                              src={getAssetUrl(photo.urls?.thumbnail || photo.urls?.original)}
+                              alt={photo.file_name}
+                              loading="lazy"
+                              onError={(e) => {
+                                if (photo.urls?.original && e.target.src !== getAssetUrl(photo.urls.original)) {
+                                  e.target.src = getAssetUrl(photo.urls.original);
+                                }
+                              }}
+                              className="w-full h-full object-cover group-hover:opacity-90 transition-opacity"
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity p-2.5 flex flex-col justify-end">
+                              <p className="text-xs font-medium text-slate-200 truncate">{photo.file_name}</p>
+                              <p className="text-[10px] text-slate-400">
+                                {photo.date_taken ? new Date(photo.date_taken).toLocaleDateString() : 'Unknown date'}
+                              </p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* Pagination Controls Footer */}
+                      <div className="pt-6 border-t border-slate-800/80 flex flex-col sm:flex-row items-center justify-between gap-4">
+                        <div className="text-xs text-slate-400">
+                          Showing <span className="font-semibold text-slate-200">{filteredPhotos.length}</span> of <span className="font-semibold text-slate-200">{totalPhotosCount}</span> total indexed photos
+                        </div>
+
+                        <div className="flex items-center gap-3">
+                          {hasMore && (
+                            <button
+                              onClick={handleLoadMore}
+                              disabled={isLoading}
+                              className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-2 shadow-lg shadow-indigo-600/20"
+                            >
+                              {isLoading ? (
+                                <>
+                                  <i className="fas fa-circle-notch fa-spin text-xs"></i>
+                                  <span>Loading photos...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <i className="fas fa-plus text-xs"></i>
+                                  <span>Load More Images ({totalPhotosCount - photos.length} remaining)</span>
+                                </>
+                              )}
+                            </button>
+                          )}
+
+                          {photos.length < totalPhotosCount && (
+                            <button
+                              onClick={() => fetchPhotos(1, false, 500)}
+                              disabled={isLoading}
+                              className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 rounded-lg text-sm font-medium transition-colors border border-slate-700"
+                            >
+                              Load All (Up to 500)
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                    </div>
+                  )}
+                </main>
+
+              </div>
+            )}
+
+            {}
+            {activeTab === 'settings' && (
+              <main className="flex-1 p-8 overflow-y-auto max-w-5xl mx-auto space-y-8">
+                
+                {/* Server Network Address Config */}
+                <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+                  <div className="flex items-center gap-3">
+                    <i className="fas fa-network-wired text-indigo-400 text-xl"></i>
+                    <div>
+                      <h2 className="text-base font-semibold text-slate-200">Server Network Address</h2>
+                      <p className="text-xs text-slate-400">Specify the URL of your Windows backend server (e.g., http://localhost:8080 or http://192.168.1.50:8080)</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-3">
+                    <input
+                      type="text"
+                      value={serverUrl}
+                      onChange={(e) => setServerUrl(e.target.value)}
+                      placeholder="http://localhost:8080"
+                      className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-4 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500"
+                    />
+                    <button
+                      onClick={() => { fetchStatus(); fetchPhotos(1, false, pageSize); notify('Connected to server!'); }}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-medium transition-colors"
+                    >
+                      Test Connection
+                    </button>
+                  </div>
+                </section>
+
+                {/* System Status Dashboard Cards */}
+                <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <p className="text-xs text-slate-400 font-medium">Indexed Photos</p>
+                    <p className="text-2xl font-bold text-slate-100 mt-2">{status?.total_photos ?? 0}</p>
+                  </div>
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <p className="text-xs text-slate-400 font-medium">Registered Tags</p>
+                    <p className="text-2xl font-bold text-slate-100 mt-2">{status?.total_tags ?? 0}</p>
+                  </div>
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <p className="text-xs text-slate-400 font-medium">Database Size</p>
+                    <p className="text-2xl font-bold text-slate-100 mt-2">
+                      {status?.db_size_bytes ? (status.db_size_bytes / (1024 * 1024)).toFixed(2) + ' MB' : '0 MB'}
+                    </p>
+                  </div>
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                    <p className="text-xs text-slate-400 font-medium">Thumbnail Cache</p>
+                    <p className="text-2xl font-bold text-slate-100 mt-2">
+                      {status?.cache_size_bytes ? (status.cache_size_bytes / (1024 * 1024)).toFixed(2) + ' MB' : '0 MB'}
+                    </p>
+                  </div>
+                </section>
+
+                {/* Monitored Directories */}
+                <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+                  <h2 className="text-base font-semibold text-slate-200">Monitored Photo Directories</h2>
+                  
+                  <form onSubmit={handleAddDirectory} className="flex gap-3">
+                    <input
+                      type="text"
+                      placeholder="e.g. C:\Users\Username\Pictures or D:\Photos"
+                      value={newDirectoryPath}
+                      onChange={(e) => setNewDirectoryPath(e.target.value)}
+                      className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-4 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500"
+                    />
+                    <button
+                      type="submit"
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
+                    >
+                      <i className="fas fa-plus text-xs"></i>
+                      <span>Add Directory</span>
+                    </button>
+                  </form>
+
+                  <div className="space-y-2 pt-2">
+                    {status?.monitored_dirs?.length === 0 ? (
+                      <p className="text-sm text-slate-500 italic">No directories added yet.</p>
+                    ) : (
+                      status?.monitored_dirs?.map((dir, idx) => (
+                        <div key={idx} className="flex items-center justify-between bg-slate-950 border border-slate-800 px-4 py-3 rounded-lg">
+                          <span className="text-sm font-mono text-slate-300">{dir}</span>
+                          <button
+                            onClick={() => handleRemoveDirectory(dir)}
+                            className="text-xs text-rose-400 hover:text-rose-300 font-medium px-2 py-1 rounded hover:bg-rose-950/50 transition-colors"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </section>
+
+                {/* Maintenance Operations */}
+                <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+                  <h2 className="text-base font-semibold text-slate-200">Maintenance & Synchronization</h2>
+                  <div className="flex flex-wrap gap-4">
+                    <button
+                      onClick={handleTriggerScan}
+                      className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 border border-slate-700"
+                    >
+                      <i className="fas fa-sync-alt text-indigo-400"></i>
+                      <span>Rescan Directories</span>
+                    </button>
+                    <button
+                      onClick={handlePurgeCache}
+                      className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 border border-slate-700"
+                    >
+                      <i className="fas fa-broom text-amber-400"></i>
+                      <span>Purge Thumbnail Cache</span>
+                    </button>
+                  </div>
+                </section>
+
+              </main>
+            )}
+
+          </div>
+
+          {}
+          {activePhotoIndex !== null && filteredPhotos[activePhotoIndex] && (
+            <div className="fixed inset-0 z-50 bg-slate-950/95 backdrop-blur-md flex">
+              
+              {/* Close Button */}
+              <button
+                onClick={() => setActivePhotoIndex(null)}
+                className="absolute top-4 right-4 z-50 w-10 h-10 rounded-full bg-slate-900/80 border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 flex items-center justify-center transition-colors"
+              >
+                <i className="fas fa-times text-lg"></i>
+              </button>
+
+              {/* Prev Button */}
+              {activePhotoIndex > 0 && (
+                <button
+                  onClick={() => setActivePhotoIndex(activePhotoIndex - 1)}
+                  className="absolute left-4 top-1/2 -translate-y-1/2 z-50 w-12 h-12 rounded-full bg-slate-900/80 border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 flex items-center justify-center transition-colors"
+                >
+                  <i className="fas fa-chevron-left text-lg"></i>
+                </button>
+              )}
+
+              {/* Main Preview Container */}
+              <div className="flex-1 flex items-center justify-center p-8">
+                <img
+                  src={getAssetUrl(filteredPhotos[activePhotoIndex].urls?.original || filteredPhotos[activePhotoIndex].urls?.thumbnail)}
+                  alt={filteredPhotos[activePhotoIndex].file_name}
+                  className="max-h-full max-w-full object-contain rounded shadow-2xl"
+                  onError={(e) => {
+                    if (filteredPhotos[activePhotoIndex]?.urls?.thumbnail) {
+                      e.target.src = getAssetUrl(filteredPhotos[activePhotoIndex].urls.thumbnail);
+                    }
+                  }}
+                />
+              </div>
+
+              {/* Next Button */}
+              {activePhotoIndex < filteredPhotos.length - 1 && (
+                <button
+                  onClick={() => setActivePhotoIndex(activePhotoIndex + 1)}
+                  className="absolute right-[340px] top-1/2 -translate-y-1/2 z-50 w-12 h-12 rounded-full bg-slate-900/80 border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 flex items-center justify-center transition-colors"
+                >
+                  <i className="fas fa-chevron-right text-lg"></i>
+                </button>
+              )}
+
+              {/* Photo Details Sidebar */}
+              <aside className="w-80 border-l border-slate-800 bg-slate-900 p-6 flex flex-col gap-6 overflow-y-auto z-40">
+                <div>
+                  <h3 className="font-semibold text-slate-100 text-base break-words">
+                    {filteredPhotos[activePhotoIndex].file_name}
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-1">
+                    {filteredPhotos[activePhotoIndex].date_taken 
+                      ? new Date(filteredPhotos[activePhotoIndex].date_taken).toLocaleString() 
+                      : 'Unknown date'}
+                  </p>
+                </div>
+
+                {/* Exif Metadata Grid */}
+                <div className="space-y-3 pt-4 border-t border-slate-800 text-xs">
+                  <h4 className="font-semibold text-slate-400 uppercase tracking-wider text-[10px]">Photo Info</h4>
+                  <div className="flex justify-between py-1 border-b border-slate-800/60">
+                    <span className="text-slate-500">Dimensions</span>
+                    <span className="text-slate-300 font-mono">
+                      {filteredPhotos[activePhotoIndex].width} × {filteredPhotos[activePhotoIndex].height}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b border-slate-800/60">
+                    <span className="text-slate-500">File Size</span>
+                    <span className="text-slate-300 font-mono">
+                      {(filteredPhotos[activePhotoIndex].file_size / (1024 * 1024)).toFixed(2)} MB
+                    </span>
+                  </div>
+                  {filteredPhotos[activePhotoIndex].camera_make && (
+                    <div className="flex justify-between py-1 border-b border-slate-800/60">
+                      <span className="text-slate-500">Camera</span>
+                      <span className="text-slate-300 truncate max-w-[150px]">
+                        {filteredPhotos[activePhotoIndex].camera_make} {filteredPhotos[activePhotoIndex].camera_model}
+                      </span>
+                    </div>
+                  )}
+                  <div className="py-1">
+                    <span className="text-slate-500 block mb-1">Path</span>
+                    <span className="text-slate-400 font-mono text-[10px] break-all block bg-slate-950 p-2 rounded border border-slate-800">
+                      {filteredPhotos[activePhotoIndex].file_path}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Attached Tags Section */}
+                <div className="space-y-3 pt-4 border-t border-slate-800">
+                  <h4 className="font-semibold text-slate-400 uppercase tracking-wider text-[10px]">Attached Tags</h4>
+                  <div className="flex flex-wrap gap-1.5">
+                    {filteredPhotos[activePhotoIndex].tags?.map(t => (
+                      <span key={t.id} className="inline-flex items-center gap-1.5 bg-slate-800 text-indigo-300 text-xs px-2.5 py-1 rounded-full border border-slate-700">
+                        <span>{t.name}</span>
+                        <button
+                          onClick={() => handleDetachTagFromPhoto(filteredPhotos[activePhotoIndex].id, t.id)}
+                          className="hover:text-rose-400"
+                        >
+                          <i className="fas fa-times text-[10px]"></i>
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+
+                  {/* Attach Available Tags */}
+                  <div className="pt-2">
+                    <label className="text-[10px] uppercase font-semibold text-slate-500 block mb-1.5">Attach Tag</label>
+                    <select
+                      onChange={(e) => {
+                        if (e.target.value) {
+                          handleAttachTagToPhoto(filteredPhotos[activePhotoIndex].id, parseInt(e.target.value));
+                          e.target.value = '';
+                        }
+                      }}
+                      className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="">+ Select tag to attach...</option>
+                      {tags.map(t => (
+                        <option key={t.id} value={t.id}>{t.name} ({t.category})</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+              </aside>
+            </div>
+          )}
+
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
