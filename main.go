@@ -609,7 +609,7 @@ func handleSystemDirectories(w http.ResponseWriter, r *http.Request) {
 				startDirectoryScan()
 			}
 		} else if req.Action == "remove" {
-			var newDirs []string
+			newDirs := []string{}
 			for _, d := range state.Config.PhotoDirs {
 				if d != req.Directory {
 					newDirs = append(newDirs, d)
@@ -617,12 +617,83 @@ func handleSystemDirectories(w http.ResponseWriter, r *http.Request) {
 			}
 			state.Config.PhotoDirs = newDirs
 			saveConfig()
+
+			// Clean up indexed photos and cached thumbnails associated with this directory
+			go pruneDirectoryFromDB(req.Directory)
+
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":  "removed",
+				"message": "Directory removed from config and background pruning initiated.",
+			})
+			return
 		}
 
 		respondJSON(w, http.StatusOK, state.Config.PhotoDirs)
 	} else {
 		respondJSON(w, http.StatusOK, state.Config.PhotoDirs)
 	}
+}
+
+// Helper to remove DB records and cached thumbnails when a directory is un-monitored
+func pruneDirectoryFromDB(dirPath string) {
+	cleanDir := filepath.Clean(dirPath)
+	targetPrefix := strings.ToLower(cleanDir)
+	if !strings.HasSuffix(targetPrefix, string(os.PathSeparator)) {
+		targetPrefix += string(os.PathSeparator)
+	}
+
+	// 1. Query all photos to match paths reliably in Go (cross-platform & Windows slash-safe)
+	rows, err := state.DB.Query("SELECT id, file_path, file_hash FROM photos")
+	if err != nil {
+		log.Printf("[Prune Error] Failed to query photos for pruning: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var idsToDelete []int
+	var hashesToDelete []string
+
+	for rows.Next() {
+		var id int
+		var filePath, hash string
+		if err := rows.Scan(&id, &filePath, &hash); err == nil {
+			cleanPhotoPath := strings.ToLower(filepath.Clean(filePath))
+			// Check if the photo path starts with the un-monitored directory path
+			if strings.HasPrefix(cleanPhotoPath, targetPrefix) || cleanPhotoPath == strings.ToLower(cleanDir) {
+				idsToDelete = append(idsToDelete, id)
+				hashesToDelete = append(hashesToDelete, hash)
+			}
+		}
+	}
+
+	// 2. Delete cached thumbnail files (both small and medium if present)
+	deletedThumbs := 0
+	for _, hash := range hashesToDelete {
+		smallThumb := filepath.Join("data", "cache", "small", hash+".webp")
+		if err := os.Remove(smallThumb); err == nil {
+			deletedThumbs++
+		}
+		mediumThumb := filepath.Join("data", "cache", "medium", hash+".webp")
+		_ = os.Remove(mediumThumb)
+	}
+
+	// 3. Delete DB entries in a transaction
+	if len(idsToDelete) > 0 {
+		tx, err := state.DB.Begin()
+		if err == nil {
+			stmt, err := tx.Prepare("DELETE FROM photos WHERE id = ?")
+			if err == nil {
+				defer stmt.Close()
+				for _, id := range idsToDelete {
+					_, _ = stmt.Exec(id)
+				}
+				_ = tx.Commit()
+			}
+		}
+	}
+
+	log.Printf("[Prune] Removed %d database records and %d cached thumbnails for directory: %s", len(idsToDelete), deletedThumbs, dirPath)
 }
 
 func handleSystemTriggerScan(w http.ResponseWriter, r *http.Request) {
