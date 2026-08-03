@@ -10,16 +10,18 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// BenchmarkProcessImage benchmarks the actual processImage function directly.
+// BenchmarkProcessImage benchmarks processImage directly using an in-memory DB
+// and overwrites thumbnails in ./tests/testdata/test_thumbnails/cache/small
 func BenchmarkProcessImage(b *testing.B) {
-	// 1. Set up paths relative to your project root or test data
-	inputDir := "./tests/testdata/images"
-	cacheDir := b.TempDir() // Go automatically creates and cleans up this temp dir
+	// 1. Define input and output directories
+	inputDir := "./tests/testdata/sample_photos"
+	testOutputDir := "./tests/testdata/test_thumbnails"
+	smallThumbDir := filepath.Join(testOutputDir, "cache", "small")
 
 	// Read image file paths
 	entries, err := os.ReadDir(inputDir)
 	if err != nil {
-		b.Fatalf("Failed to read test image directory: %v", err)
+		b.Fatalf("Failed to read test image directory (%s): %v", inputDir, err)
 	}
 
 	var imagePaths []string
@@ -36,7 +38,7 @@ func BenchmarkProcessImage(b *testing.B) {
 		b.Fatalf("No sample images found in %s", inputDir)
 	}
 
-	// 2. Initialize an in-memory SQLite DB for testing
+	// 2. Initialize in-memory SQLite DB
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		b.Fatalf("Failed to open test database: %v", err)
@@ -63,27 +65,28 @@ func BenchmarkProcessImage(b *testing.B) {
 		b.Fatalf("Failed to create test schema: %v", err)
 	}
 
-	// 3. Inject mock/test state into your global app state
-	// (Adjust this to match your actual 'state' struct setup)
+	// 3. Inject mock state
 	oldDB := state.DB
 	oldDataDir := state.Config.DataDir
 
 	state.DB = db
-	state.Config.DataDir = cacheDir
+	state.Config.DataDir = testOutputDir
 
-	// Ensure subdirectories exist for thumbnail cache
-	_ = os.MkdirAll(filepath.Join(cacheDir, "cache", "small"), 0755)
-
-	// Restore original state when benchmark finishes
 	defer func() {
 		state.DB = oldDB
 		state.Config.DataDir = oldDataDir
 	}()
 
-	// Reset timer to exclude directory reading & DB schema initialization
+	// 4. Clean and recreate output directory on each run
+	_ = os.RemoveAll(smallThumbDir)
+	if err := os.MkdirAll(smallThumbDir, 0755); err != nil {
+		b.Fatalf("Failed to create thumbnail directory (%s): %v", smallThumbDir, err)
+	}
+
+	// Reset timer to measure only processing time
 	b.ResetTimer()
 
-	// 4. Run the benchmark loop
+	// 5. Run benchmark
 	for i := 0; i < b.N; i++ {
 		for _, imgPath := range imagePaths {
 			err := processImage(imgPath)
@@ -93,5 +96,3 @@ func BenchmarkProcessImage(b *testing.B) {
 		}
 	}
 }
-
-// go test -bench=BenchmarkProcessImage -run=^$ -benchmem
