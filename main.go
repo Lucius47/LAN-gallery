@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"net/http"
@@ -193,6 +194,7 @@ func processImage(filePath string) error {
 
 	dateTaken := info.ModTime()
 	var cameraMake, cameraModel string
+	var exifThumb []byte
 
 	// Extract EXIF data
 	x, err := exif.Decode(file)
@@ -206,32 +208,40 @@ func processImage(filePath string) error {
 		if modelTag, err := x.Get(exif.Model); err == nil {
 			cameraModel, _ = modelTag.StringVal()
 		}
-	}
-
-	// Read image dimensions and create thumbnails using imaging package
-	img, err := imaging.Open(filePath, imaging.AutoOrientation(true))
-	if err != nil {
-		return fmt.Errorf("failed to decode image: %w", err)
-	}
-
-	bounds := img.Bounds()
-	width, height := bounds.Dx(), bounds.Dy()
-
-	// 1. Generate Small Grid Thumbnail (250px)
-	smallThumbPath := filepath.Join(state.Config.DataDir, "cache", "small", hash+".jpg")
-	if _, err := os.Stat(smallThumbPath); os.IsNotExist(err) {
-		smallImg := imaging.Fit(img, 250, 250, imaging.Lanczos)
-		_ = imaging.Save(smallImg, smallThumbPath, imaging.JPEGQuality(80))
-	}
-
-	/*
-		// 2. Generate Medium Preview (1920px) - Commented out to save processing time and disk storage
-		mediumThumbPath := filepath.Join(state.Config.DataDir, "cache", "medium", hash+".jpg")
-		if _, err := os.Stat(mediumThumbPath); os.IsNotExist(err) {
-			mediumImg := imaging.Fit(img, 1920, 1920, imaging.Lanczos)
-			_ = imaging.Save(mediumImg, mediumThumbPath, imaging.JPEGQuality(85))
+		// Try extracting embedded thumbnail bytes
+		if thumbBytes, err := x.JpegThumbnail(); err == nil && len(thumbBytes) > 0 {
+			exifThumb = thumbBytes
 		}
-	*/
+	}
+
+	// Extract ORIGINAL photo dimensions (fast header read + orientation check)
+	width, height, _ := getOrientedDimensions(file, x)
+
+	smallThumbPath := filepath.Join(state.Config.DataDir, "cache", "small", hash+".jpg")
+
+	// FAST PATH: Write embedded thumbnail to disk if available
+	if len(exifThumb) > 0 {
+		if _, err := os.Stat(smallThumbPath); os.IsNotExist(err) {
+			_ = os.WriteFile(smallThumbPath, exifThumb, 0644)
+		}
+	}
+
+	// SLOW FALLBACK PATH: If no EXIF thumbnail exists (or dimensions failed), decode full image
+	if len(exifThumb) == 0 || width == 0 || height == 0 {
+		img, err := imaging.Open(filePath, imaging.AutoOrientation(true))
+		if err != nil {
+			return fmt.Errorf("failed to decode image: %w", err)
+		}
+
+		bounds := img.Bounds()
+		width, height = bounds.Dx(), bounds.Dy()
+
+		// Generate Small Grid Thumbnail (250px)
+		if _, err := os.Stat(smallThumbPath); os.IsNotExist(err) {
+			smallImg := imaging.Fit(img, 250, 250, imaging.Lanczos)
+			_ = imaging.Save(smallImg, smallThumbPath, imaging.JPEGQuality(80))
+		}
+	}
 
 	// Insert into SQLite
 	_, err = state.DB.Exec(`
@@ -247,6 +257,29 @@ func processImage(filePath string) error {
 	`, filePath, filepath.Base(filePath), hash, info.Size(), width, height, dateTaken, info.ModTime(), strings.TrimSpace(cameraMake), strings.TrimSpace(cameraModel))
 
 	return err
+}
+
+// Helper to extract true oriented dimensions without pixel decoding
+func getOrientedDimensions(file *os.File, x *exif.Exif) (int, int, error) {
+	_, _ = file.Seek(0, io.SeekStart)
+	cfg, _, err := image.DecodeConfig(file)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	w, h := cfg.Width, cfg.Height
+
+	if x != nil {
+		if orientTag, err := x.Get(exif.Orientation); err == nil {
+			if val, err := orientTag.Int(0); err == nil {
+				if val >= 5 && val <= 8 {
+					w, h = h, w // Swap width and height for 90/270 rotated orientations
+				}
+			}
+		}
+	}
+
+	return w, h, nil
 }
 
 func startDirectoryScan() {
