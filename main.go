@@ -703,7 +703,7 @@ func pruneDirectoryFromDB(dirPath string) {
 	// 2. Delete cached thumbnail files (both small and medium if present)
 	deletedThumbs := 0
 	for _, hash := range hashesToDelete {
-		smallThumb := filepath.Join("data", "cache", "small", hash+".webp")
+		smallThumb := filepath.Join("data", "cache", "small", hash+".webp") // TOFIX: Ensure consistent thumbnail extension
 		if err := os.Remove(smallThumb); err == nil {
 			deletedThumbs++
 		}
